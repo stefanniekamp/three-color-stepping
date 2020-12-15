@@ -1,0 +1,156 @@
+exposure = 110.0;
+
+nrTimePoints = 500;
+
+cameraBack = "Andor-Back";
+cameraLeft = "Andor-Left";
+
+/********* NO NEED TO EDIT BELOW THIS LINE *************************
+ * Nico Stuurman, 2018
+ * Copyright University of California
+ * BSD v2 license
+ ********************************************************************/
+  
+import mmcorej.StrVector;
+
+store = mm.data().createRAMDatastore();
+cb = mm.data().getCoordsBuilder();
+smb = mm.data().getSummaryMetadataBuilder();
+String[] channelNames =  {"488-560LP-Back", "561-560LP-Left", "640-560LP-Left"};
+sm = smb.channelGroup("Channels-Stefan").channelNames(channelNames).build();
+store.setSummaryMetadata(sm);
+dw = mm.displays().createDisplay(store);
+ds = dw.getDisplaySettings();
+dsCP = ds.copyBuilder();
+newDs = dsCP.colorModeComposite().
+			channel(0, dsCP.getChannelSettings(0).copyBuilder().colorGreen().build()).
+			channel(1, dsCP.getChannelSettings(1).copyBuilder().colorBlue().build()).
+			channel(2, dsCP.getChannelSettings(2).copyBuilder().colorRed().build()).
+			build();
+dw.setDisplaySettings(newDs);
+
+
+mm.displays().manage(store);
+
+core = mm.getCMMCore();
+core.setConfig("Channels-Stefan", "488-560LP-Back");
+core.waitForConfig("Channels-Stefan", "488-560LP-Back");
+
+core.setExposure(cameraBack, exposure);
+core.setExposure(cameraLeft, exposure);
+
+core.setAutoShutter(false);
+core.setShutterOpen(true);
+
+aotfSequence = core.getProperty("AOTF", "Sequence");
+aotfBlank = core.getProperty("AOTF", "Blank");
+core.setProperty("AOTF", "Sequence", "On");
+StrVector laserLines = new StrVector();
+laserLines.add("488nm");
+laserLines.add("561nm");
+laserLines.add("640nm");
+laserLines.add("none");
+laserLines.add("561nm");
+laserLines.add("640nm");
+core.loadPropertySequence("AOTF", "LaserLine", laserLines);
+core.startPropertySequence("AOTF", "LaserLine");
+
+core.initializeCircularBuffer();
+
+core.setProperty(cameraBack, "Trigger", "External");
+core.waitForDevice(cameraBack);
+core.setProperty(cameraLeft, "Trigger", "Internal");
+core.waitForDevice(cameraLeft);
+
+core.prepareSequenceAcquisition(cameraBack);
+core.prepareSequenceAcquisition(cameraLeft);
+core.startSequenceAcquisition(cameraBack, nrTimePoints * 2, 0, true);
+core.startSequenceAcquisition(cameraLeft, nrTimePoints * 3, 0, true);
+
+start = System.nanoTime();
+
+done = false;
+cameraBackDone = false;
+cameraLeftDone = false;
+cameraBackExpected = (int) (3.0 * nrTimePoints) / 2.0 - 1;
+cameraLeftExpected = (3 * nrTimePoints - 1);
+int timePoint = (int) 0;
+int channel = (int) 1;
+int sleepCounter = 0;
+int imageCounter = 0;
+int threadSleepTime = (int) exposure + 75;
+
+while (!done && sleepCounter < 10) {
+	while (core.getRemainingImageCount() == 0 && sleepCounter < 25) {
+      Thread.sleep(threadSleepTime);
+		sleepCounter++;
+	}
+	if (core.getRemainingImageCount() > 0) {
+		sleepCounter = 0;
+		tImg = core.popNextTaggedImage();
+		imageCounter++;
+	
+		img = mm.data().convertTaggedImage(tImg);
+		metadata = img.getMetadata();
+		camera = metadata.getCamera();
+		nr = metadata.getImageNumber();
+		useImage = false;
+		if (camera.equals(cameraBack)) {			
+			if (nr >= cameraBackExpected) {
+				cameraBackDone = true;
+			}
+			if (nr % 3 == 0) {
+				useImage = true;
+				timePoint = (int) (nr / 3 * 2);
+				channel = 0;
+			}
+		}
+		if (camera.equals(cameraLeft)) {
+			if ( nr >= cameraLeftExpected ) {
+				cameraLeftDone = true;
+			}
+			if ( (nr % 3) > 0) {
+				useImage = true;
+				timePoint = (int) (nr / 3);
+				channel = (int) (nr % 3) ;
+				
+			}
+		}
+		mm.scripter().message(" Image says: Camera " + camera + " nr: " + nr);
+		if (useImage) {
+			t = System.nanoTime();
+			coords = cb.time(timePoint).channel(channel).stagePosition(0).z(0).build();
+			elapsed = (double) (t - start) / 1000000.0;
+			metadata = metadata.copy().exposureMs(exposure).elapsedTimeMs(elapsed).build();
+			img = img.copyWith(coords, metadata);
+			store.putImage(img);
+		}
+		done = cameraBackDone && cameraLeftDone;
+	}
+	
+}
+
+end = System.nanoTime();
+duration = (end - start) / 1000000.0;
+
+core.setShutterOpen(false);
+core.setAutoShutter(true);
+core.stopSequenceAcquisition(cameraBack);
+core.stopSequenceAcquisition(cameraLeft);
+core.setProperty(cameraBack, "Trigger", "Software");
+core.setProperty(cameraLeft, "Trigger", "Software");
+core.stopPropertySequence("AOTF", "LaserLine");
+core.setProperty("AOTF", "Sequence", aotfSequence);
+core.setProperty("AOTF", "Blank", aotfBlank);
+
+store.freeze();
+//store.close();
+
+
+
+if (sleepCounter >=20) {
+	mm.scripter().message ("Did not collect all expected images");
+}
+
+mm.scripter().message ("Elapsed time: " + duration + " ms");
+mm.scripter().message("Popped " + imageCounter + " images");
